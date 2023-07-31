@@ -1,7 +1,7 @@
 "use client";
 
 import { io as ClientIO } from "socket.io-client";
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useCallback } from "react";
 
 interface IChatMessage {
   userName: string;
@@ -21,6 +21,9 @@ const Index: React.FC = () => {
   // connected flag
   const [connected, setConnected] = useState<boolean>(false);
 
+  // user count
+  const [userCount, setUserCount] = useState<number>(0);
+
   // init chat and message
   const [userName, setUserName] = useState<string>("");
   const [messageInput, setMessageInput] = useState<string>("");
@@ -28,7 +31,7 @@ const Index: React.FC = () => {
   const [chatMessages, setChatMessages] = useState<IChatMessage[]>([]);
 
   // dispatch message to other users
-  const sendApiSocketChat = async (
+  const sendApiSocketChat = useCallback(async (
     chatMessage: IChatMessage
   ): Promise<Response> => {
     return await fetch("/api/chat", {
@@ -38,7 +41,9 @@ const Index: React.FC = () => {
       },
       body: JSON.stringify(chatMessage),
     });
-  };
+  },
+    []
+  );
 
   const sendMessage = async () => {
     if (messageInput) {
@@ -46,34 +51,39 @@ const Index: React.FC = () => {
         userName,
         message: messageInput,
       };
-
       const resp = await sendApiSocketChat(chatMessage);
-
       if (resp.ok) setMessageInput("");
     }
 
     (inputRef?.current as any).focus();
   };
 
-  const sendEnterRoomMessage = async () => {
+  const sendEnterRoomMessage = useCallback(async () => {
     const chatMessage: IChatMessage = {
-      userName: "Bot",
+      userName: "Moderator",
       message: `${userName} has entered the chat`,
     };
 
-    const resp = await sendApiSocketChat(chatMessage);
-    if (!resp.ok) {
-      setTimeout(() => {
-        sendEnterRoomMessage();
-      }, 500);
+  const resp = await sendApiSocketChat(chatMessage);
+  if (resp.ok) {
+    // Fetch updated user count after a new user joins
+    const userCountResp = await fetch("/api/userCount");
+    if (userCountResp.ok) {
+      const { count } = await userCountResp.json();
+      setUserCount(count);
     }
-  };
+  } else {
+    setTimeout(() => {
+      sendEnterRoomMessage();
+    }, 500);
+  }
+}, [userName, sendApiSocketChat]);
 
   useEffect((): any => {
     if (userName) {
       sendEnterRoomMessage();
     }
-  }, [userName]);
+  }, [userName, sendEnterRoomMessage]);
 
   useEffect((): any => {
     const socket = new (ClientIO as any)(process.env.NEXT_PUBLIC_SITE_URL, {
@@ -93,9 +103,18 @@ const Index: React.FC = () => {
       setChatMessages([...chatMessages]);
     });
 
+    // update user count on new user connection
+    socket.on("userConnect", (count: number) => {
+      setUserCount(count);
+    });
+
+    // update user count on user disconnection
+    socket.on("userDisconnect", (count: number) => {
+      setUserCount(count);
+    });
     // socket disconnect onUnmount if exists
     if (socket) return () => socket.disconnect();
-  }, []);
+  }, [chatMessages]);
 
   if (!connected) {
     return (
@@ -115,6 +134,9 @@ const Index: React.FC = () => {
     return (
       <div className="flex items-center p-4 mx-auto min-h-screen justify-center bg-black">
         <div className="gap-4 flex flex-col items-center justify-center w-full h-full">
+          <h3 className="font-bold text-white text-xl">
+            Please enter your username
+          </h3>
           <div className="bg-black p-4 h-20">
             <div className="flex flex-row flex-1 h-full divide-gray-800 divide-x">
               <div className="pr-2 flex-1">
@@ -158,9 +180,12 @@ const Index: React.FC = () => {
         <h1 className="text-center text-2xl font-semibold">
           Real-Time Chat App
         </h1>
-        <h2 className="mt-2 text-center">Powered by Next.js and Socket.io</h2>
+        <h2 className="mt-2 text-center">Powered by Next.js, Socket.io, and libsignal</h2>
       </div>
       <div className="flex flex-col flex-1 bg-gray-600">
+        <div className="flex items-center justify-center px-4 text-white">
+          {connected ? `Users Online: ${userCount}` : "Connecting..."}
+        </div>       
         <div className="flex-1 p-4 font-mono">
           {chatMessages.length ? (
             chatMessages.map((chatMessage, i) => (
