@@ -11,7 +11,6 @@ import (
   "time"
 
   "golang.org/x/time/rate"
-
   "github.com/coder/websocket"
 )
 
@@ -36,48 +35,48 @@ type chatServer struct {
   subscribers   map[*subscriber]struct{}
 }
 
-func (cs *chatServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	cs.serveMux.ServeHTTP(w, r)
+func (cs *chatServer) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
+	cs.serveMux.ServeHTTP(writer, request)
 }
 
 // addSubscriber registers a subscriber.
-func (cs *chatServer) addSubscriber(s *subscriber) {
+func (cs *chatServer) addSubscriber(sub *subscriber) {
 	cs.subscribersMu.Lock()
-	cs.subscribers[s] = struct{}{}
+	cs.subscribers[sub] = struct{}{}
 	cs.subscribersMu.Unlock()
 }
 
 // deleteSubscriber deletes the given subscriber.
-func (cs *chatServer) deleteSubscriber(s *subscriber) {
+func (cs *chatServer) deleteSubscriber(sub *subscriber) {
 	cs.subscribersMu.Lock()
-	delete(cs.subscribers, s)
+	delete(cs.subscribers, sub)
 	cs.subscribersMu.Unlock()
 }
 
-func writeTimeout(ctx context.Context, timeout time.Duration, c *websocket.Conn, msg []byte) error {
+func writeTimeout(ctx context.Context, timeout time.Duration, conn *websocket.Conn, msg []byte) error {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	return c.Write(ctx, websocket.MessageText, msg)
+	return conn.Write(ctx, websocket.MessageText, msg)
 }
 
 // publishHandler reads the request body with a limit of 8192 bytes and then publishes
 // the received message.
-func (cs *chatServer) publishHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
+func (cs *chatServer) publishHandler(writer http.ResponseWriter, request *http.Request) {
+	if request.Method != "POST" {
+		http.Error(writer, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
 		return
 	}
-	body := http.MaxBytesReader(w, r.Body, 8192)
+	body := http.MaxBytesReader(writer, request.Body, 8192)
 	msg, err := io.ReadAll(body)
 	if err != nil {
-		http.Error(w, http.StatusText(http.StatusRequestEntityTooLarge), http.StatusRequestEntityTooLarge)
+		http.Error(writer, http.StatusText(http.StatusRequestEntityTooLarge), http.StatusRequestEntityTooLarge)
 		return
 	}
 
 	cs.publish(msg)
 
-	w.WriteHeader(http.StatusAccepted)
+	writer.WriteHeader(http.StatusAccepted)
 }
 
 
@@ -89,7 +88,7 @@ func (cs *chatServer) publishHandler(w http.ResponseWriter, r *http.Request) {
 //
 // It uses CloseRead to keep reading from the connection to process control
 // messages and cancel the context if the connection drops.
-func (cs *chatServer) subscribe(ctx context.Context, w http.ResponseWriter, r *http.Request) error {
+func (cs *chatServer) subscribe(ctx context.Context, writer http.ResponseWriter, request *http.Request) error {
 	var mu sync.Mutex
 	var c *websocket.Conn
 	var closed bool
@@ -107,7 +106,7 @@ func (cs *chatServer) subscribe(ctx context.Context, w http.ResponseWriter, r *h
 	cs.addSubscriber(s)
 	defer cs.deleteSubscriber(s)
 
-	c2, err := websocket.Accept(w, r, nil)
+	c2, err := websocket.Accept(writer, request, nil)
 	if err != nil {
 		return err
 	}
@@ -170,8 +169,8 @@ func newChatServer() *chatServer {
 
 // subscribeHandler accepts the WebSocket connection and then subscribes
 // it to all future messages.
-func (cs *chatServer) subscribeHandler(w http.ResponseWriter, r *http.Request) {
-	err := cs.subscribe(r.Context(), w, r)
+func (cs *chatServer) subscribeHandler(writer http.ResponseWriter, request *http.Request) {
+	err := cs.subscribe(request.Context(), writer, request)
 	if errors.Is(err, context.Canceled) {
 		return
 	}
