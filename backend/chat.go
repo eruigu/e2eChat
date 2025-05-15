@@ -35,6 +35,7 @@ type chatServer struct {
   subscribers   map[*subscriber]struct{}
 }
 
+
 func (cs *chatServer) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	cs.serveMux.ServeHTTP(writer, request)
 }
@@ -47,6 +48,7 @@ func (cs *chatServer) addSubscriber(sub *subscriber) {
 }
 
 // deleteSubscriber deletes the given subscriber.
+
 func (cs *chatServer) deleteSubscriber(sub *subscriber) {
 	cs.subscribersMu.Lock()
 	delete(cs.subscribers, sub)
@@ -62,6 +64,7 @@ func writeTimeout(ctx context.Context, timeout time.Duration, conn *websocket.Co
 
 // publishHandler reads the request body with a limit of 8192 bytes and then publishes
 // the received message.
+
 func (cs *chatServer) publishHandler(writer http.ResponseWriter, request *http.Request) {
 	if request.Method != "POST" {
 		http.Error(writer, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
@@ -75,7 +78,6 @@ func (cs *chatServer) publishHandler(writer http.ResponseWriter, request *http.R
 	}
 
 	cs.publish(msg)
-
 	writer.WriteHeader(http.StatusAccepted)
 }
 
@@ -107,6 +109,7 @@ func (cs *chatServer) subscribe(ctx context.Context, writer http.ResponseWriter,
 	defer cs.deleteSubscriber(s)
 
 	c2, err := websocket.Accept(writer, request, nil)
+
 	if err != nil {
 		return err
 	}
@@ -171,6 +174,7 @@ func newChatServer() *chatServer {
 // it to all future messages.
 func (cs *chatServer) subscribeHandler(writer http.ResponseWriter, request *http.Request) {
 	err := cs.subscribe(request.Context(), writer, request)
+  
 	if errors.Is(err, context.Canceled) {
 		return
 	}
