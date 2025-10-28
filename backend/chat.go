@@ -1,53 +1,50 @@
 package main
 
 import (
-  "context"
-  "errors"
-  "io"
-  "log"
-  "net"
-  "net/http"
-  "sync"
-  "time"
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"sync"
+	"time"
 
-  "golang.org/x/time/rate"
-
-  "github.com/coder/websocket"
+	"golang.org/x/time/rate"
+	"github.com/coder/websocket"
 )
 
-// subscriber represents a subscriber.
-// Messages are sent on the msgs channel and if the client
-// cannot keep up with the messages, closeSlow is called.
+// Message struct
+type Message struct {
+	User string `json:"user"`
+	Text string `json:"text"`
+	Time string `json:"time"`
+}
+
 type subscriber struct {
+	name      string
 	msgs      chan []byte
 	closeSlow func()
 }
 
-// chatServer enables broadcasting to a set of subscribers.
 type chatServer struct {
-  
-  subscriberMessageBuffer int  // max number of messages that can be queued 
-  publishLimiter *rate.Limiter  // controls the rate limit applied to the publish endpoint.
-  logf func(f string, v ...interface{}) // logf controls where logs are sent.
-
-  serveMux http.ServeMux // serveMux routes the various endpoints to the appropriate handler.
-  
-  subscribersMu sync.Mutex
-  subscribers   map[*subscriber]struct{}
+	subscriberMessageBuffer int
+	publishLimiter          *rate.Limiter
+	logf                    func(f string, v ...any)
+	serveMux                http.ServeMux
+	subscribersMu           sync.Mutex
+	subscribers             map[*subscriber]struct{}
 }
 
 func (cs *chatServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	cs.serveMux.ServeHTTP(w, r)
 }
 
-// addSubscriber registers a subscriber.
 func (cs *chatServer) addSubscriber(s *subscriber) {
 	cs.subscribersMu.Lock()
 	cs.subscribers[s] = struct{}{}
 	cs.subscribersMu.Unlock()
 }
 
-// deleteSubscriber deletes the given subscriber.
 func (cs *chatServer) deleteSubscriber(s *subscriber) {
 	cs.subscribersMu.Lock()
 	delete(cs.subscribers, s)
@@ -57,76 +54,117 @@ func (cs *chatServer) deleteSubscriber(s *subscriber) {
 func writeTimeout(ctx context.Context, timeout time.Duration, c *websocket.Conn, msg []byte) error {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-
 	return c.Write(ctx, websocket.MessageText, msg)
 }
 
-// publishHandler reads the request body with a limit of 8192 bytes and then publishes
-// the received message.
-func (cs *chatServer) publishHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
-		return
-	}
-	body := http.MaxBytesReader(w, r.Body, 8192)
-	msg, err := io.ReadAll(body)
-	if err != nil {
-		http.Error(w, http.StatusText(http.StatusRequestEntityTooLarge), http.StatusRequestEntityTooLarge)
-		return
-	}
+func (cs *chatServer) publish(msg Message) {
+	data, _ := json.Marshal(msg)
+	cs.subscribersMu.Lock()
+	defer cs.subscribersMu.Unlock()
+	cs.publishLimiter.Wait(context.Background())
 
-	cs.publish(msg)
+	for s := range cs.subscribers {
+		select {
+		case s.msgs <- data:
+		default:
+			go s.closeSlow()
+		}
+	}
+}
 
-	w.WriteHeader(http.StatusAccepted)
+func (cs *chatServer) publishBytes(data []byte) {
+	cs.subscribersMu.Lock()
+	defer cs.subscribersMu.Unlock()
+	cs.publishLimiter.Wait(context.Background())
+
+	for s := range cs.subscribers {
+		select {
+		case s.msgs <- data: // forward raw bytes
+		default:
+			go s.closeSlow()
+		}
+	}
 }
 
 
-// subscribe subscribes the given WebSocket to all broadcast messages.
-// It creates a subscriber with a buffered msgs chan to give some room to slower
-// connections and then registers the subscriber. It then listens for all messages
-// and writes them to the WebSocket. If the context is cancelled or
-// an error occurs, it returns and deletes the subscription.
-//
-// It uses CloseRead to keep reading from the connection to process control
-// messages and cancel the context if the connection drops.
+func (cs *chatServer) publishSystemMessage(text string) {
+	msg := Message{
+		User: "SYSTEM",
+		Text: text,
+		Time: time.Now().Format("15:04:05"),
+	}
+	cs.publish(msg)
+}
+
 func (cs *chatServer) subscribe(ctx context.Context, w http.ResponseWriter, r *http.Request) error {
+	name := r.URL.Query().Get("name")
+	if name == "" {
+		name = "Anonymous"
+	}
+
 	var mu sync.Mutex
 	var c *websocket.Conn
 	var closed bool
+
 	s := &subscriber{
+		name: name,
 		msgs: make(chan []byte, cs.subscriberMessageBuffer),
 		closeSlow: func() {
 			mu.Lock()
 			defer mu.Unlock()
 			closed = true
 			if c != nil {
-				c.Close(websocket.StatusPolicyViolation, "connection too slow to keep up with messages")
+				c.Close(websocket.StatusPolicyViolation, "connection too slow")
 			}
 		},
 	}
-	cs.addSubscriber(s)
-	defer cs.deleteSubscriber(s)
 
-	c2, err := websocket.Accept(w, r, nil)
+	cs.addSubscriber(s)
+	defer func() {
+		cs.deleteSubscriber(s)
+		cs.publishSystemMessage(fmt.Sprintf("👋 %s left the chat", name))
+	}()
+
+	// Accept WebSocket with compression enabled
+	c2, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+		CompressionMode: websocket.CompressionContextTakeover,
+	})
 	if err != nil {
 		return err
 	}
+
 	mu.Lock()
 	if closed {
 		mu.Unlock()
-		return net.ErrClosed
+		return nil
 	}
 	c = c2
 	mu.Unlock()
-	defer c.CloseNow()
+	defer c.Close(websocket.StatusNormalClosure, "bye")
 
-	ctx = c.CloseRead(ctx)
+	cs.publishSystemMessage(fmt.Sprintf("💬 %s joined the chat", name))
+	// ctx = c.CloseRead(ctx)
 
+	// Reader goroutine: handle messages from client
+	go func() {
+		for {
+			typ, msgBytes, err := c.Read(ctx)
+			if err != nil {
+				return
+			}
+			if typ != websocket.MessageText {
+				continue
+			}
+
+			cs.publishBytes(msgBytes)
+		}
+	}()
+
+	// Writer loop: send messages to client
 	for {
 		select {
-		case msg := <-s.msgs:
-			err := writeTimeout(ctx, time.Second*5, c, msg)
-			if err != nil {
+		case data := <-s.msgs:
+			if err := writeTimeout(ctx, 5*time.Second, c, data); err != nil {
 				return err
 			}
 		case <-ctx.Done():
@@ -135,52 +173,20 @@ func (cs *chatServer) subscribe(ctx context.Context, w http.ResponseWriter, r *h
 	}
 }
 
-// publish publishes the msg to all subscribers.
-// It never blocks and so messages to slow subscribers
-// are dropped.
-func (cs *chatServer) publish(msg []byte) {
-	cs.subscribersMu.Lock()
-	defer cs.subscribersMu.Unlock()
-
-	cs.publishLimiter.Wait(context.Background())
-
-	for s := range cs.subscribers {
-		select {
-		case s.msgs <- msg:
-		default:
-			go s.closeSlow()
-		}
-	}
-}
-
-// newChatServer constructs a chatServer with the defaults.
-func newChatServer() *chatServer {
-  cs := &chatServer{
-    subscriberMessageBuffer: 16,
-    logf:                    log.Printf,
-    subscribers:             make(map[*subscriber]struct{}),
-    publishLimiter:          rate.NewLimiter(rate.Every(time.Millisecond*100), 8),
-  }
-  cs.serveMux.Handle("/", http.FileServer(http.Dir(".")))
-  cs.serveMux.HandleFunc("/subscribe", cs.subscribeHandler)
-  cs.serveMux.HandleFunc("/publish", cs.publishHandler)
-
-  return cs
-}
-
-// subscribeHandler accepts the WebSocket connection and then subscribes
-// it to all future messages.
 func (cs *chatServer) subscribeHandler(w http.ResponseWriter, r *http.Request) {
 	err := cs.subscribe(r.Context(), w, r)
-	if errors.Is(err, context.Canceled) {
-		return
-	}
-	if websocket.CloseStatus(err) == websocket.StatusNormalClosure ||
-		websocket.CloseStatus(err) == websocket.StatusGoingAway {
-		return
-	}
 	if err != nil {
 		cs.logf("%v", err)
-		return
 	}
+}
+
+func newChatServer() *chatServer {
+	cs := &chatServer{
+		subscriberMessageBuffer: 16,
+		logf:                    log.Printf,
+		subscribers:             make(map[*subscriber]struct{}),
+		publishLimiter:          rate.NewLimiter(rate.Every(100*time.Millisecond), 8),
+	}
+	cs.serveMux.HandleFunc("/subscribe", cs.subscribeHandler)
+	return cs
 }
