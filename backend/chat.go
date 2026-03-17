@@ -13,6 +13,11 @@ import (
 	"github.com/coder/websocket"
 )
 
+type OnlineUpdate struct{
+	Type string `json:"type"` 
+	Count int `json:"count"`
+}
+
 // Message struct
 type Message struct {
 	User string `json:"user"`
@@ -37,6 +42,30 @@ type chatServer struct {
 
 func (cs *chatServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	cs.serveMux.ServeHTTP(w, r)
+}
+
+func (cs *chatServer) publishOnlineCount() {
+	cs.subscribersMu.Lock()
+	count := len(cs.subscribers)
+
+	data, _ := json.Marshal(OnlineUpdate{
+		Type:  "online_count",
+		Count: count,
+	})
+
+	subs := make([]*subscriber, 0, len(cs.subscribers))
+	for s := range cs.subscribers {
+		subs = append(subs, s)
+	}
+	cs.subscribersMu.Unlock()
+
+	for _, s := range subs {
+		select {
+		case s.msgs <- data:
+		default:
+			go s.closeSlow()
+		}
+	}
 }
 
 func (cs *chatServer) addSubscriber(s *subscriber) {
@@ -114,19 +143,22 @@ func (cs *chatServer) subscribe(ctx context.Context, w http.ResponseWriter, r *h
 			defer mu.Unlock()
 			closed = true
 			if c != nil {
-				c.Close(websocket.StatusPolicyViolation, "connection too slow")
+				_ = c.Close(websocket.StatusPolicyViolation, "connection too slow")
 			}
 		},
 	}
 
 	cs.addSubscriber(s)
+	cs.publishOnlineCount()
+
 	defer func() {
 		cs.deleteSubscriber(s)
+	cs.publishOnlineCount()
 		cs.publishSystemMessage(fmt.Sprintf("👋 %s left the chat", name))
 	}()
 
-	// Accept WebSocket with compression enabled
 	c2, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+		OriginPatterns:  []string{"localhost:5173"},
 		CompressionMode: websocket.CompressionContextTakeover,
 	})
 	if err != nil {
@@ -140,13 +172,19 @@ func (cs *chatServer) subscribe(ctx context.Context, w http.ResponseWriter, r *h
 	}
 	c = c2
 	mu.Unlock()
-	defer c.Close(websocket.StatusNormalClosure, "bye")
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	defer func() {
+		_ = c.Close(websocket.StatusNormalClosure, "bye")
+	}()
 
 	cs.publishSystemMessage(fmt.Sprintf("💬 %s joined the chat", name))
-	// ctx = c.CloseRead(ctx)
 
-	// Reader goroutine: handle messages from client
+	// Reader goroutine
 	go func() {
+		defer cancel()
+
 		for {
 			typ, msgBytes, err := c.Read(ctx)
 			if err != nil {
@@ -160,22 +198,24 @@ func (cs *chatServer) subscribe(ctx context.Context, w http.ResponseWriter, r *h
 		}
 	}()
 
-	// Writer loop: send messages to client
+	// Writer loop
 	for {
 		select {
-		case data := <-s.msgs:
+		case data, ok := <-s.msgs:
+			if !ok {
+				return nil
+			}
 			if err := writeTimeout(ctx, 5*time.Second, c, data); err != nil {
-				return err
+				return nil
 			}
 		case <-ctx.Done():
-			return ctx.Err()
+			return nil
 		}
 	}
 }
 
 func (cs *chatServer) subscribeHandler(w http.ResponseWriter, r *http.Request) {
-	err := cs.subscribe(r.Context(), w, r)
-	if err != nil {
+	if err := cs.subscribe(r.Context(), w, r); err != nil {
 		cs.logf("%v", err)
 	}
 }
