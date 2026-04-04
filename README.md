@@ -2,7 +2,7 @@
 
 A lightweight real time chat application built with Go, WebSockets, and Svelte.
 
-***
+---
 
 ## Tech Stack
 
